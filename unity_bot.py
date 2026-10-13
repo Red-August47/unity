@@ -737,7 +737,7 @@ async def load_from_url(update: Update, url: str):
     uid = update.effective_user.id
     st = state[uid]
     if st["busy"]:
-        return await update.message.reply_text("⏳ Still working on something. Please wait.")
+        return  # silent: ignore extra commands while busy
     st["busy"] = True
     path = WORK / f"{uid}.download"
     try:
@@ -811,7 +811,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     st = state[uid]
     if st["busy"]:
-        return await update.message.reply_text("⏳ Still working on something. Please wait.")
+        return  # silent: ignore extra commands while busy
     st["busy"] = True
     try:
         path = WORK / f"{uid}.download"
@@ -829,7 +829,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bundle_dir(uid).exists():
         return await update.message.reply_text("Nothing loaded yet. Use /load <link>.")
     if st["busy"]:
-        return await update.message.reply_text("⏳ Still working on something. Please wait.")
+        return  # silent: ignore extra commands while busy
     st["busy"] = True
     try:
         await scan_and_report(update, st, uid)
@@ -853,7 +853,7 @@ async def photos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not st["loaded"] or not root.exists():
         return await update.message.reply_text("Nothing loaded yet. Use /load <link>.")
     if st["busy"]:
-        return await update.message.reply_text("⏳ Still working on something. Please wait.")
+        return  # silent: ignore extra commands while busy
 
     args = [a.lower() for a in context.args]
     mode = "big" if args and args[0] == "big" else "all"
@@ -949,7 +949,7 @@ async def extract_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not st["loaded"] or not root.exists():
         return await update.message.reply_text("Nothing loaded yet. Use /load <link>.")
     if st["busy"]:
-        return await update.message.reply_text("⏳ Still working on something. Please wait.")
+        return  # silent: ignore extra commands while busy
 
     word = " ".join(context.args).strip().lower()
     st["busy"] = True
