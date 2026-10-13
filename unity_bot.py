@@ -771,7 +771,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /scan – read the bundles again\n"
         "• /types – what was found, and any problems\n"
         "• /photos – send images as photos (large pictures first)\n"
-        "• /photos_big – only large pictures (backgrounds, scenes)\n"
+        "• /photos big – only large pictures (backgrounds, scenes)\n"
         "• /photos <word> – only images whose name contains the word\n"
         "• /extract [word] – images as PNG zip parts\n"
         "• /sprites on|off – include Sprite objects too (off by default)\n"
