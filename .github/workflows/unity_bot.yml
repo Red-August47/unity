@@ -1,0 +1,30 @@
+name: Unity Extractor Bot
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: unity-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install python-telegram-bot==21.6 Pillow httpx UnityPy texture2ddecoder
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.UNITY_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+        run: python unity_bot.py
