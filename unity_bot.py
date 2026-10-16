@@ -16,6 +16,7 @@ from urllib.parse import urlparse, parse_qs
 
 import httpx
 import UnityPy
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from PIL import Image
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -30,6 +31,9 @@ MAX_PART = 45 * 1024 * 1024            # Telegram bots can upload up to 50 MB pe
 MAX_UNPACKED = 12 * 1024 ** 3          # refuse zips that would unpack to more than this
 MIN_SIDE = 9                           # ignore textures 8 px or smaller (placeholders)
 BUNDLE_MAGICS = (b"UnityFS", b"UnityWeb", b"UnityRaw")
+# This game's catalog says its bundles go through Addressables' "AESStreamProcessor":
+# AES-128 in ECB mode with this key (found in the game's code, verified on a real bundle).
+AES_KEYS = [b"ABCDEFGHIJKLMNOP"]
 
 TOKEN = os.environ["BOT_TOKEN"].strip()   # strip: a pasted secret can carry a hidden newline
 ADMIN_CHAT_ID = (os.getenv("ADMIN_CHAT_ID") or "").strip() or None
@@ -136,10 +140,65 @@ def find_bundles(root: Path):
                   key=lambda p: natural_key(str(p)))
 
 
+def _aes_ecb(key: bytes, data: bytes) -> bytes:
+    n = len(data) // 16 * 16
+    return Cipher(algorithms.AES(key), modes.ECB()).decryptor().update(data[:n])
+
+
+def decrypt_bundle_file(path: Path) -> bool:
+    """If path is an AES-encrypted Unity bundle, decrypt it in place. True if it was converted."""
+    try:
+        size = path.stat().st_size
+        if size < 32 or size % 16:
+            return False
+        with open(path, "rb") as f:
+            first = f.read(16)
+        if first.startswith(BUNDLE_MAGICS):
+            return False
+        for key in AES_KEYS:
+            if _aes_ecb(key, first).startswith(BUNDLE_MAGICS):
+                data = path.read_bytes()
+                out = _aes_ecb(key, data)
+                # UnityFS header: magic\0, version(4), player ver\0, engine ver\0, total size (8, big endian)
+                try:
+                    i = out.index(b"\0") + 1 + 4
+                    i = out.index(b"\0", i) + 1
+                    i = out.index(b"\0", i) + 1
+                    total = struct.unpack(">q", out[i:i + 8])[0]
+                    if 0 < total <= len(out):
+                        out = out[:total]          # drop the encryption padding
+                except (ValueError, struct.error):
+                    pass
+                tmp = path.with_name(path.name + ".dec")
+                tmp.write_bytes(out)
+                tmp.replace(path)
+                return True
+    except Exception as e:
+        print(f"[decrypt] {path.name}: {short_err(e)}")
+    return False
+
+
+def decrypt_all(root: Path, p: dict) -> int:
+    files = [q for q in root.rglob("*") if q.is_file()]
+    p.update(n=len(files), i=0)
+    done = 0
+    for q in files:
+        done += decrypt_bundle_file(q)
+        p["i"] += 1
+    return done
+
+
+def count_locked(root: Path) -> int:
+    """.bundle files that do NOT start with a Unity header: encrypted / obfuscated by the game."""
+    return sum(1 for q in root.rglob("*.bundle") if q.is_file() and not is_bundle_file(q))
+
+
 def scan_bundles(root: Path, p: dict):
     """Open every bundle and list its textures. p is a progress dict that the ticker reads."""
+    p.update(tex=0, bad=0)
+    decrypted = decrypt_all(root, p)
     files = find_bundles(root)
-    p.update(n=len(files), i=0, tex=0, bad=0)
+    p.update(n=len(files), i=0, tex=0, bad=0, locked=count_locked(root), decrypted=decrypted)
     textures, sprites = [], []
     types = Counter()
     errors = Counter()
@@ -419,11 +478,12 @@ class LoadError(Exception):
     pass
 
 
-def unpack(src: Path, root: Path, p: dict):
-    """src is a zip of bundles or a single bundle. Fills root with bundle files."""
-    shutil.rmtree(root, ignore_errors=True)
-    root.mkdir(parents=True)
+def unpack(src: Path, root: Path, p: dict, name: str = "single.bundle"):
+    """src is a zip of bundles or a single bundle file. A zip replaces what was loaded;
+    single files are ADDED to what is already there."""
     if zipfile.is_zipfile(src):
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
         with zipfile.ZipFile(src) as zf:
             members = [m for m in zf.infolist() if not m.is_dir()]
             total = sum(m.file_size for m in members)
@@ -444,11 +504,13 @@ def unpack(src: Path, root: Path, p: dict):
                     shutil.copyfileobj(s, d, 1024 * 1024)
         src.unlink(missing_ok=True)
         return
-    if is_bundle_file(src):
-        shutil.move(str(src), root / "single.bundle")
+    root.mkdir(parents=True, exist_ok=True)
+    if is_bundle_file(src) or name.lower().endswith(".bundle"):
+        # kept even if it has no Unity header: the game may have encrypted it (the scan says so)
+        shutil.move(str(src), root / safe_name(name))
         return
     src.unlink(missing_ok=True)
-    raise LoadError("This is neither a zip file nor a Unity bundle (.bundle). "
+    raise LoadError("This is neither a zip file nor a .bundle file. "
                     "If you used a link, make sure it is a direct download link.")
 
 
@@ -665,9 +727,26 @@ async def send_image(message, jpg, original, name):
 # Loading and scanning
 # ==========================================================================
 
-def build_report(st, types, errors, examples, nfiles, bad) -> str:
+ENCRYPTED_HELP = (
+    "The bot already unlocks bundles encrypted with this game's AES key. These use something else, "
+    "so I need their key.\n"
+    "What helps: send me the game's global-metadata.dat "
+    "(<game>_Data/il2cpp_data/Metadata/) and GameAssembly.dll, or, if the game has a "
+    "<game>_Data/Managed folder, Assembly-CSharp.dll. The key is usually stored in there."
+)
+
+
+def build_report(st, types, errors, examples, nfiles, bad, locked=0, decrypted=0) -> str:
     big = sum(1 for t in st["textures"] if is_scene(t.w, t.h))
-    lines = [
+    lines = []
+    if decrypted:
+        lines.append(f"🔓 Decrypted {decrypted} encrypted bundle(s) with the game's AES key")
+    if locked:
+        lines.append(
+            f"🔒 {locked} .bundle file(s) have no Unity header – they look ENCRYPTED by the game "
+            "(random-looking data), so they can't be read without the game's key. See /encrypted."
+        )
+    lines += [
         f"📦 Bundles: {nfiles} found, {nfiles - bad} opened, {bad} failed",
         f"🖼 Textures: {len(st['textures'])} · Sprites: {len(st['sprites'])}"
         + (" (sprites are OFF, see /sprites)" if not st["sprites_on"] and st["sprites"] else ""),
@@ -699,15 +778,21 @@ async def scan_and_report(update: Update, st, uid):
         return await update.message.reply_text(f"❌ Scan failed: {short_err(e)}")
     st.update(textures=textures, sprites=sprites, loaded=nfiles > 0, photo_jobs=None,
               photo_pos=0, photo_sub=0, seen=set())
+    locked = p.get("locked", 0)
     if not nfiles:
+        st["report"] = ""
+        if locked:
+            return await update.message.reply_text(
+                f"🔒 Found {locked} .bundle file(s), but none has a Unity header – they look encrypted by "
+                "the game, so I can't read them without its key.\n\n" + ENCRYPTED_HELP)
         return await update.message.reply_text("❌ No Unity bundles found in what you sent.")
-    st["report"] = build_report(st, types, errors, examples, nfiles, p["bad"])
+    st["report"] = build_report(st, types, errors, examples, nfiles, p["bad"], locked, p.get("decrypted", 0))
     for line in errors:
         print(f"[scan problem] {line} (e.g. {examples.get(line)})")
     text = "✅ Scan finished\n\n" + st["report"]
     if textures or (sprites and st["sprites_on"]):
-        text += ("\n\n/photos big – only the large pictures\n/photos – every image, large ones first\n"
-                 "/photos <word> – only names containing the word\n/extract – everything as zip parts")
+        text += ("\n\n/photos_big – only the large pictures\n/photos – every image, large ones first\n"
+                 "/photos <word> – type it yourself, e.g. /photos castle\n/extract – everything as zip parts")
     await update.message.reply_text(text)
 
 
@@ -718,7 +803,7 @@ async def load_file(update: Update, path: Path, name: str):
     status = await update.message.reply_text("📂 Unpacking…")
     p = {"n": 0, "i": 0}
     try:
-        await run_with_ticker(status, lambda: unpack(path, root, p), p, _count_text("📂 Unpacking"))
+        await run_with_ticker(status, lambda: unpack(path, root, p, name), p, _count_text("📂 Unpacking"))
     except LoadError as e:
         path.unlink(missing_ok=True)
         return await update.message.reply_text(f"❌ {e}")
@@ -737,7 +822,7 @@ async def load_from_url(update: Update, url: str):
     uid = update.effective_user.id
     st = state[uid]
     if st["busy"]:
-        return  # silent: ignore extra commands while busy
+        return await update.message.reply_text("⏳ Still working on something. Please wait.")
     st["busy"] = True
     path = WORK / f"{uid}.download"
     try:
@@ -765,22 +850,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Zip the folder with the .bundle files (StreamingAssets/aa/StandaloneWindows64)\n"
         "2. Upload the zip somewhere with a direct link (GitHub Release, Google Drive, Dropbox)\n"
         "3. Send /load <link> (or just paste the link)\n"
-        "4. Send /photos big\n\n"
+        "4. Send /photos_big\n\n"
         "Commands:\n"
         "• /load <link> – download a zip of bundles (or one .bundle)\n"
         "• /scan – read the bundles again\n"
         "• /types – what was found, and any problems\n"
         "• /photos – send images as photos (large pictures first)\n"
-        "• /photos big – only large pictures (backgrounds, scenes)\n"
+        "• /photos_big – only large pictures (backgrounds, scenes)\n"
         "• /photos <word> – only images whose name contains the word\n"
         "• /extract [word] – images as PNG zip parts\n"
-        "• /sprites on|off – include Sprite objects too (off by default)\n"
-        "• /split on|off – cut sprite sheets into separate frames (off by default)\n"
+        "• /sprites_on or /sprites_off – include Sprite objects too (off by default)\n"
+        "• /split_on or /split_off – cut sprite sheets into separate frames (off by default)\n"
         "• /unityver <version> – set Unity version if bundles fail to read\n"
         "• /clear – delete the loaded files\n"
         "• /stop – shut down the bot\n\n"
-        "Single .bundle files up to 20 MB can also be sent directly; more than one at a time "
-        "needs a zip link, because Telegram bots can't download more than 20 MB."
+        "You can also send .bundle files straight into this chat (up to 20 MB each, as many as you like), "
+        "then send /scan. A whole folder needs a zip link, because Telegram bots can't download "
+        "more than 20 MB."
     )
 
 
@@ -810,14 +896,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     uid = update.effective_user.id
     st = state[uid]
+    fname = doc.file_name or "game.zip"
+    if fname.lower().endswith(".bundle"):
+        # single bundle files are simply ADDED (several can arrive at once); send /scan when done
+        root = bundle_dir(uid)
+        root.mkdir(parents=True, exist_ok=True)
+        dest = root / safe_name(fname)
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(custom_path=dest)
+        n = sum(1 for q in root.rglob("*.bundle"))
+        return await update.message.reply_text(f"➕ Added {fname} ({n} bundle file(s) kept). Send /scan when you have sent them all.")
     if st["busy"]:
-        return  # silent: ignore extra commands while busy
+        return await update.message.reply_text("⏳ Still working on something. Please wait.")
     st["busy"] = True
     try:
         path = WORK / f"{uid}.download"
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(custom_path=path)
-        await load_file(update, path, doc.file_name or "game.zip")
+        await load_file(update, path, fname)
     finally:
         st["busy"] = False
 
@@ -829,12 +925,17 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bundle_dir(uid).exists():
         return await update.message.reply_text("Nothing loaded yet. Use /load <link>.")
     if st["busy"]:
-        return  # silent: ignore extra commands while busy
+        return await update.message.reply_text("⏳ Still working on something. Please wait.")
     st["busy"] = True
     try:
         await scan_and_report(update, st, uid)
     finally:
         st["busy"] = False
+
+
+@guarded
+async def encrypted_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔒 Encrypted bundles\n\n" + ENCRYPTED_HELP)
 
 
 @guarded
@@ -853,7 +954,7 @@ async def photos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not st["loaded"] or not root.exists():
         return await update.message.reply_text("Nothing loaded yet. Use /load <link>.")
     if st["busy"]:
-        return  # silent: ignore extra commands while busy
+        return await update.message.reply_text("⏳ Still working on something. Please wait.")
 
     args = [a.lower() for a in context.args]
     mode = "big" if args and args[0] == "big" else "all"
@@ -949,7 +1050,7 @@ async def extract_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not st["loaded"] or not root.exists():
         return await update.message.reply_text("Nothing loaded yet. Use /load <link>.")
     if st["busy"]:
-        return  # silent: ignore extra commands while busy
+        return await update.message.reply_text("⏳ Still working on something. Please wait.")
 
     word = " ".join(context.args).strip().lower()
     st["busy"] = True
@@ -1004,8 +1105,8 @@ async def sprites_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["photo_jobs"] = None
     await update.message.reply_text(
         f"Sprites are {'ON' if st['sprites_on'] else 'OFF'}.\n"
-        "/sprites on – also send Sprite objects (cut-outs from atlases, can repeat what the textures already show)\n"
-        "/sprites off – textures only"
+        "/sprites_on – also send Sprite objects (cut-outs from atlases, can repeat what the textures already show)\n"
+        "/sprites_off – textures only"
     )
 
 
@@ -1017,8 +1118,8 @@ async def split_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["split"] = arg == "on"
     await update.message.reply_text(
         f"Sprite-sheet splitting is {'ON' if st['split'] else 'OFF'}.\n"
-        "/split on – cut sheets (many frames in one image) into separate images\n"
-        "/split off – send every image as it is"
+        "/split_on – cut sheets (many frames in one image) into separate images\n"
+        "/split_off – send every image as it is"
     )
 
 
@@ -1061,6 +1162,7 @@ async def post_init(application: Application):
         BotCommand("scan", "Read the bundles again"),
         BotCommand("types", "What was found / problems"),
         BotCommand("photos", "Send images as photos (big = large only)"),
+        BotCommand("photos_big", "Send only the large pictures"),
         BotCommand("extract", "Images as PNG zip parts"),
         BotCommand("sprites", "Include Sprite objects: on / off"),
         BotCommand("split", "Split sprite sheets: on / off"),
@@ -1075,6 +1177,16 @@ async def post_init(application: Application):
             )
         except Exception as e:
             print(f"[startup notification failed] {e}")
+
+
+def alias(fn, *args):
+    """A one-word command (e.g. /photos_big) that runs fn with fixed arguments – Telegram only
+    makes the first word of a command tappable, so '/photos big' can't be tapped."""
+    @guarded
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.args = list(args)
+        return await fn(update, context)
+    return wrapper
 
 
 def main():
@@ -1093,12 +1205,18 @@ def main():
     app.add_handler(CommandHandler("load", load_cmd))
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("types", types_cmd))
+    app.add_handler(CommandHandler("encrypted", encrypted_cmd))
     app.add_handler(CommandHandler("photos", photos_cmd))
     app.add_handler(CommandHandler("extract", extract_cmd))
     app.add_handler(CommandHandler("sprites", sprites_cmd))
     app.add_handler(CommandHandler("split", split_cmd))
     app.add_handler(CommandHandler("unityver", unityver_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CommandHandler("photos_big", alias(photos_cmd, "big")))
+    app.add_handler(CommandHandler("sprites_on", alias(sprites_cmd, "on")))
+    app.add_handler(CommandHandler("sprites_off", alias(sprites_cmd, "off")))
+    app.add_handler(CommandHandler("split_on", alias(split_cmd, "on")))
+    app.add_handler(CommandHandler("split_off", alias(split_cmd, "off")))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"https?://"), link_message))
