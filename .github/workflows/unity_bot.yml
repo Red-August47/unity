@@ -21,7 +21,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install python-telegram-bot==21.6 Pillow httpx UnityPy texture2ddecoder
+        run: pip install python-telegram-bot==21.6 Pillow cryptography httpx UnityPy texture2ddecoder
 
       - name: Run bot
         env:
