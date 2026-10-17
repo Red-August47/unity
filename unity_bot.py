@@ -1347,6 +1347,12 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @guarded
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import datetime
+    sent = update.message.date
+    if sent and (datetime.datetime.now(datetime.timezone.utc) - sent).total_seconds() > 120:
+        # an old /stop that was waiting in Telegram while the bot was offline must not kill the new run
+        return await update.message.reply_text("Ignored an old /stop that was sent before the bot started.")
+    print("[stop] /stop received - shutting down", flush=True)
     await update.message.reply_text("Bot is shutting down. Start a new workflow run to use it again.")
     os._exit(0)
 
@@ -1421,7 +1427,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"https?://"), link_message))
 
-    print("Bot started...")
+    print("Bot started...", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
