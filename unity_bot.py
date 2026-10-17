@@ -16,7 +16,13 @@ from urllib.parse import urlparse, parse_qs
 
 import httpx
 import UnityPy
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:      # the workflow file may not list it yet: install it on the spot
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "cryptography"])
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from PIL import Image
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -46,6 +52,7 @@ TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024   # Telegram bots can only download up to 2
 state = defaultdict(lambda: {
     "loaded": False, "name": "game", "textures": [], "sprites": [], "report": "",
     "busy": False, "split": False, "sprites_on": False,
+    "texts": [], "added": 0, "added_task": None,
     "photo_jobs": None, "photo_pos": 0, "photo_sub": 0, "photo_mode": "all",
     "photo_word": "", "seen": set(),
 })
@@ -63,6 +70,14 @@ class Tex:
     w: int
     h: int
     kind: str         # "Texture2D" or "Sprite"
+
+
+@dataclass
+class TextRef:
+    name: str
+    path: str         # the asset's path inside the game (e.g. Setting/StorySetting.csv), or ""
+    bundle: str
+    pid: int
 
 
 # ==========================================================================
@@ -199,7 +214,7 @@ def scan_bundles(root: Path, p: dict):
     decrypted = decrypt_all(root, p)
     files = find_bundles(root)
     p.update(n=len(files), i=0, tex=0, bad=0, locked=count_locked(root), decrypted=decrypted)
-    textures, sprites = [], []
+    textures, sprites, texts = [], [], []
     types = Counter()
     errors = Counter()
     examples = {}
@@ -215,9 +230,24 @@ def scan_bundles(root: Path, p: dict):
             examples.setdefault(key, rel)
             p["i"] += 1
             continue
+        cont = {}
+        try:
+            for cpath, cobj in env.container.items():
+                cont[int(getattr(cobj, "path_id", -1))] = str(cpath)
+        except Exception:
+            pass
         for obj in objs:
             t = type_name(obj)
             types[t] += 1
+            if t == "TextAsset":
+                try:
+                    nm = str(getattr(obj.read(), "m_Name", "") or f"text_{obj.path_id}")
+                    texts.append(TextRef(nm, cont.get(int(obj.path_id), ""), rel, int(obj.path_id)))
+                except Exception as e:
+                    key = "reading TextAsset: " + short_err(e)
+                    errors[key] += 1
+                    examples.setdefault(key, rel)
+                continue
             if t not in ("Texture2D", "Sprite"):
                 continue
             try:
@@ -238,7 +268,7 @@ def scan_bundles(root: Path, p: dict):
                 errors[key] += 1
                 examples.setdefault(key, rel)
         p["i"] += 1
-    return textures, sprites, types, errors, examples, len(files)
+    return textures, sprites, types, errors, examples, len(files), texts
 
 
 _cache = {"path": None, "objs": None, "env": None}
@@ -558,6 +588,7 @@ class DownloadError(Exception):
     pass
 
 
+QUIET_AFTER = 10        # seconds without a new uploaded file before the "send /scan" notice
 PROGRESS_EVERY = 4      # seconds between progress updates
 STALL_AFTER = 10        # seconds without data before warning that the download may be stuck
 
@@ -751,6 +782,7 @@ def build_report(st, types, errors, examples, nfiles, bad, locked=0, decrypted=0
         f"🖼 Textures: {len(st['textures'])} · Sprites: {len(st['sprites'])}"
         + (" (sprites are OFF, see /sprites)" if not st["sprites_on"] and st["sprites"] else ""),
         f"🏞 Large wide pictures (scenes): {big}",
+        f"📄 Text files (story / tables): {len(st['texts'])}" + (" – see /texts" if st["texts"] else ""),
     ]
     if types:
         lines.append("Object types: " + " · ".join(f"{k} {v}" for k, v in types.most_common(8)))
@@ -771,12 +803,12 @@ async def scan_and_report(update: Update, st, uid):
     status = await update.message.reply_text("🔍 Reading bundles…")
     p = {"n": 0, "i": 0, "tex": 0, "bad": 0}
     try:
-        textures, sprites, types, errors, examples, nfiles = await run_with_ticker(
+        textures, sprites, types, errors, examples, nfiles, texts = await run_with_ticker(
             status, lambda: scan_bundles(root, p), p, _count_text("🔍 Reading bundles"))
     except Exception as e:
         print(f"[ERROR] scan failed: {short_err(e)}")
         return await update.message.reply_text(f"❌ Scan failed: {short_err(e)}")
-    st.update(textures=textures, sprites=sprites, loaded=nfiles > 0, photo_jobs=None,
+    st.update(textures=textures, sprites=sprites, texts=texts, loaded=nfiles > 0, photo_jobs=None,
               photo_pos=0, photo_sub=0, seen=set())
     locked = p.get("locked", 0)
     if not nfiles:
@@ -859,6 +891,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /photos_big – only large pictures (backgrounds, scenes)\n"
         "• /photos <word> – only images whose name contains the word\n"
         "• /extract [word] – images as PNG zip parts\n"
+        "• /texts – game data tables and English story scripts (zip)\n"
+        "• /texts_all – every text file, or /texts <word> to pick by name\n"
         "• /sprites_on or /sprites_off – include Sprite objects too (off by default)\n"
         "• /split_on or /split_off – cut sprite sheets into separate frames (off by default)\n"
         "• /unityver <version> – set Unity version if bundles fail to read\n"
@@ -904,8 +938,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dest = root / safe_name(fname)
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(custom_path=dest)
-        n = sum(1 for q in root.rglob("*.bundle"))
-        return await update.message.reply_text(f"➕ Added {fname} ({n} bundle file(s) kept). Send /scan when you have sent them all.")
+        # one notice only, after a 10 second pause in the uploads (not one reply per file)
+        st["added"] += 1
+        old = st["added_task"]
+        if old and not old.done():
+            old.cancel()
+        message = update.message
+
+        async def notify():
+            await asyncio.sleep(QUIET_AFTER)
+            got, st["added"] = st["added"], 0
+            total = sum(1 for q in root.rglob("*.bundle"))
+            await message.reply_text(
+                f"➕ Received {got} bundle file(s) ({total} kept in total).\nSend /scan when you have sent them all.")
+
+        st["added_task"] = asyncio.create_task(notify())
+        return
     if st["busy"]:
         return await update.message.reply_text("⏳ Still working on something. Please wait.")
     st["busy"] = True
@@ -1096,6 +1144,154 @@ async def extract_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+TEXT_KEY = b"S9mjhbQGVfL39V4hHPDYvDoY9ZUtkget"       # SecurityUtil.KEY in the game's code
+TEXT_IV = b"tnOhhdu7dvKGuNhFXrER2oe9IZ5XCuXg"        # SecurityUtil.IV
+
+
+def _readable(b: bytes) -> bool:
+    if not b:
+        return False
+    try:
+        t = b[:4000].decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return sum(c.isprintable() or c in "\r\n\t" for c in t) / max(1, len(t)) > 0.95
+
+
+def text_bytes(root: Path, ref: TextRef):
+    """-> (data, how). Unpacks gzip and tries the game's own key when the content is scrambled."""
+    import gzip
+    obj = get_object(root, ref.bundle, ref.pid)
+    v = obj.read().m_Script
+    data = v if isinstance(v, (bytes, bytearray)) else str(v).encode("utf-8", "surrogateescape")
+    data = bytes(data)
+    how = "as stored"
+    if data[:2] == b"\x1f\x8b":
+        try:
+            data, how = gzip.decompress(data), "gunzipped"
+        except Exception:
+            pass
+    if _readable(data):
+        return data, how
+    if len(data) % 16 == 0 and len(data) >= 16:
+        tries = [(TEXT_KEY, M(iv)) for iv in (TEXT_IV[:16], TEXT_IV[16:], b"\0" * 16) for M in (modes.CBC,)]
+        tries += [(TEXT_KEY, modes.ECB())] + [(k, modes.ECB()) for k in AES_KEYS]
+        for key, mode in tries:
+            try:
+                x = Cipher(algorithms.AES(key), mode).decryptor()
+                out = x.update(data) + x.finalize()
+                pad = out[-1]
+                if 1 <= pad <= 16:
+                    out = out[:-pad]
+                if out[:2] == b"\x1f\x8b":
+                    out = gzip.decompress(out)
+                if _readable(out):
+                    return out, "decrypted with the game's key"
+            except Exception:
+                continue
+    return data, "UNREADABLE (still scrambled)"
+
+
+def pick_texts(st, word: str):
+    word = word.lower()
+    refs = st["texts"]
+    if word == "all":
+        return list(refs)
+    if word:
+        return [r for r in refs if word in r.path.lower() or word in r.name.lower()]
+    # default: the data tables and the English story scripts
+    out = []
+    for r in refs:
+        p = r.path.replace("\\", "/").lower()
+        if "/setting/" in p or p.endswith(".csv") or "/i18n/en/story/" in p:
+            out.append(r)
+    return out or [r for r in refs if "story" in r.name.lower() or "setting" in r.name.lower()]
+
+
+def build_text_parts(root: Path, refs, out_dir: Path, p: dict):
+    parts, used = [], set()
+    notes = Counter()
+    first_error = ""
+    cur = {"zf": None, "idx": 0, "n": 0}
+    p.update(n=len(refs), i=0)
+
+    def new_part():
+        if cur["zf"]:
+            cur["zf"].close()
+        cur["idx"] += 1
+        path = out_dir / f"texts_part{cur['idx']:02d}.zip"
+        cur["zf"] = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6)
+        cur["n"] = 0
+        parts.append(path)
+
+    new_part()
+    for r in refs:
+        p["i"] += 1
+        try:
+            data, how = text_bytes(root, r)
+        except Exception as e:
+            notes["failed"] += 1
+            first_error = first_error or short_err(e)
+            continue
+        notes[how] += 1
+        base = r.path.replace("Assets/Addressables/", "").strip("/") if r.path else r.name
+        base = "/".join(safe_name(x) for x in base.split("/"))
+        if "." not in base.rsplit("/", 1)[-1]:
+            base += ".txt"
+        name = unique_name(base, used)
+        if cur["n"] and cur["zf"].fp.tell() + len(data) > MAX_PART:
+            new_part()
+        cur["zf"].writestr(name, data)
+        cur["n"] += 1
+    cur["zf"].close()
+    if cur["n"] == 0 and len(parts) == 1:
+        parts[0].unlink()
+        parts = []
+    return parts, notes, first_error
+
+
+@guarded
+async def texts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    st = state[uid]
+    root = bundle_dir(uid)
+    if not st["loaded"] or not root.exists():
+        return await update.message.reply_text("Nothing loaded yet. Use /load <link>.")
+    if not st["texts"]:
+        return await update.message.reply_text("No text files were found in the bundles. Check /types.")
+    if st["busy"]:
+        return await update.message.reply_text("⏳ Still working on something. Please wait.")
+    word = " ".join(context.args).strip()
+    st["busy"] = True
+    out_dir = WORK / f"texts_{uid}"
+    try:
+        refs = pick_texts(st, word)
+        if not refs:
+            names = ", ".join(sorted({r.path.rsplit("/", 1)[-1] or r.name for r in st["texts"]})[:25])
+            return await update.message.reply_text(f"Nothing matched. Some names: {names}")
+        status = await update.message.reply_text(f"Reading {len(refs)} text file(s)…")
+        shutil.rmtree(out_dir, ignore_errors=True)
+        out_dir.mkdir(parents=True)
+        p = {"n": len(refs), "i": 0}
+        parts, notes, err = await run_with_ticker(
+            status, lambda: build_text_parts(root, refs, out_dir, p), p, _count_text("📄 Reading texts"))
+        if not parts:
+            return await update.message.reply_text("❌ Nothing could be read." + (f"\nFirst problem: {err}" if err else ""))
+        for i, part in enumerate(parts, 1):
+            if not await send_document_safe(update.message, part, f"Texts {i}/{len(parts)}"):
+                await update.message.reply_text(f"⚠️ Could not send part {i}.")
+            part.unlink(missing_ok=True)
+        lines = [f"✅ Sent {sum(notes.values()) - notes.get('failed', 0)} text file(s) in {len(parts)} zip(s)."]
+        lines += [f"• {n}× {how}" for how, n in notes.items() if how != "failed"]
+        if notes.get("failed"):
+            lines.append(f"⚠️ {notes['failed']} failed. First problem: {err}")
+        lines.append("Use /texts all for everything, or /texts <word> to pick by name (e.g. /texts StorySetting).")
+        await update.message.reply_text("\n".join(lines))
+    finally:
+        st["busy"] = False
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 @guarded
 async def sprites_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = state[update.effective_user.id]
@@ -1144,7 +1340,7 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = state[uid]
     _cache.update(path=None, objs=None, env=None)
     shutil.rmtree(bundle_dir(uid), ignore_errors=True)
-    st.update(loaded=False, textures=[], sprites=[], report="", photo_jobs=None, photo_pos=0,
+    st.update(loaded=False, textures=[], sprites=[], texts=[], report="", photo_jobs=None, photo_pos=0,
               photo_sub=0, photo_mode="all", photo_word="", seen=set())
     await update.message.reply_text("🗑️ Cleared.")
 
@@ -1164,6 +1360,8 @@ async def post_init(application: Application):
         BotCommand("photos", "Send images as photos (big = large only)"),
         BotCommand("photos_big", "Send only the large pictures"),
         BotCommand("extract", "Images as PNG zip parts"),
+        BotCommand("texts", "Story / table files (CSV, scripts)"),
+        BotCommand("texts_all", "Every text file"),
         BotCommand("sprites", "Include Sprite objects: on / off"),
         BotCommand("split", "Split sprite sheets: on / off"),
         BotCommand("unityver", "Set Unity version"),
@@ -1206,6 +1404,8 @@ def main():
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("types", types_cmd))
     app.add_handler(CommandHandler("encrypted", encrypted_cmd))
+    app.add_handler(CommandHandler("texts", texts_cmd))
+    app.add_handler(CommandHandler("texts_all", alias(texts_cmd, "all")))
     app.add_handler(CommandHandler("photos", photos_cmd))
     app.add_handler(CommandHandler("extract", extract_cmd))
     app.add_handler(CommandHandler("sprites", sprites_cmd))
